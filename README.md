@@ -1,6 +1,6 @@
-# LocalSend Transfer Skill for Codex
+# LocalSend Transfer Skill for AI coding agents
 
-A Codex skill and cross-platform CLI for sending and receiving files over the
+A SKILL.md-compatible skill and cross-platform CLI for sending and receiving files over the
 local network with [LocalSend](https://localsend.org). The Python package wraps
 the LocalSend v2 protocol and packages code based on the MIT-licensed
 [`localsend-cli`](https://github.com/Chordlini/localsend-cli).
@@ -24,13 +24,13 @@ dependency. Mobile devices only need the normal LocalSend app to receive files.
 ### pipx (recommended)
 
 ```bash
-pipx install "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.0"
+pipx install "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.1"
 ```
 
 ### uv
 
 ```bash
-uv tool install "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.0"
+uv tool install "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.1"
 ```
 
 ### pip
@@ -38,13 +38,13 @@ uv tool install "localsend-codex-skill @ git+https://github.com/qybgh/localsend-
 macOS / Linux:
 
 ```bash
-python3 -m pip install --user "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.0"
+python3 -m pip install --user "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.1"
 ```
 
 Windows PowerShell:
 
 ```powershell
-py -3 -m pip install --user "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.0"
+py -3 -m pip install --user "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.1"
 ```
 
 ### From a local checkout
@@ -69,23 +69,72 @@ After installation, the command is available as:
 localsend-transfer --help
 ```
 
-## Install as a Codex skill
+## Install as an agent skill
 
-### macOS / Linux
+### Codex
+
+macOS / Linux:
 
 ```bash
 git clone https://github.com/qybgh/localsend-codex-skill.git ~/.codex/skills/localsend-transfer
 ```
 
-### Windows PowerShell
+Windows PowerShell:
 
 ```powershell
 git clone https://github.com/qybgh/localsend-codex-skill.git "$env:USERPROFILE\.codex\skills\localsend-transfer"
 ```
 
-You can also download the repository ZIP from GitHub and extract it to
-`~/.codex/skills/localsend-transfer` (or
-`%USERPROFILE%\.codex\skills\localsend-transfer` on Windows).
+Or use the bundled installer:
+
+```bash
+python scripts/install_skill.py --agent codex
+```
+
+### Claude Code
+
+User scope:
+
+```bash
+git clone https://github.com/qybgh/localsend-codex-skill.git ~/.claude/skills/localsend-transfer
+```
+
+macOS PowerShell equivalent:
+
+```powershell
+git clone https://github.com/qybgh/localsend-codex-skill.git "$env:USERPROFILE\.claude\skills\localsend-transfer"
+```
+
+Project scope, run from the target repository:
+
+```bash
+git clone https://github.com/qybgh/localsend-codex-skill.git .claude/skills/localsend-transfer
+```
+
+Or use the bundled installer:
+
+```bash
+python scripts/install_skill.py --agent claude-code
+# project scope:
+python scripts/install_skill.py --agent claude-code --dir .claude/skills/localsend-transfer
+```
+
+### Other SKILL.md-compatible agents
+
+If your product supports the SKILL.md convention, copy this repository to its
+documented global or project skills directory. The core instruction and CLI are
+not Codex-specific.
+
+### CLI-only products
+
+Agents that do not read skills can still use the transfer command after
+installing the package with pipx, uv, or pip. Then ask or script against:
+
+```bash
+localsend-transfer discover --json -t 3
+localsend-transfer send --to "iPhone" /path/to/file.pdf
+localsend-transfer receive --save-dir ~/Downloads/localsend
+```
 
 ## Command examples
 
@@ -115,9 +164,9 @@ Custom advertised name:
 localsend-transfer --alias "Work Mac" receive --save-dir ~/Downloads/localsend
 ```
 
-## Use with Codex
+## Use with an agent
 
-Ask Codex naturally:
+Ask the agent naturally:
 
 ```text
 Discover LocalSend devices on this network.
@@ -167,7 +216,7 @@ pipx uninstall localsend-codex-skill
 pip:
 
 ```bash
-python -m pip install --upgrade "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.0"
+python -m pip install --upgrade "localsend-codex-skill @ git+https://github.com/qybgh/localsend-codex-skill.git@v0.1.1"
 python -m pip uninstall localsend-codex-skill
 ```
 
