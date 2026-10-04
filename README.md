@@ -1,5 +1,7 @@
 # LocalSend Transfer Skill for AI coding agents
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A SKILL.md-compatible skill and cross-platform CLI for sending and receiving files over the
 local network with [LocalSend](https://localsend.org). The Python package wraps
 the LocalSend v2 protocol and packages code based on the MIT-licensed
