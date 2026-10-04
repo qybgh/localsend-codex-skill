@@ -1,6 +1,6 @@
 ---
 name: localsend-transfer
-description: Send, discover, or receive files over the local network with LocalSend through the bundled localsend-cli. Use when the user asks to share files with a nearby device, find LocalSend receivers, or accept an incoming LAN transfer.
+description: Send, discover, or receive files over the local network with LocalSend. Use when the user asks to share files with a nearby device, find LocalSend receivers, or accept an incoming LAN transfer.
 metadata:
   upstream: https://github.com/Chordlini/localsend-cli
   protocol: https://github.com/localsend/protocol
@@ -8,74 +8,88 @@ metadata:
 
 # LocalSend Transfer
 
-Use the bundled zero-dependency CLI to transfer files over the local network with LocalSend. Python 3.8+ and `openssl` are required.
+Transfer files over the local network with LocalSend. Prefer the installed
+`localsend-transfer` command. If it is unavailable, use the bundled standalone
+CLI from this skill.
 
-## Setup
+## Choosing the command
 
-Resolve `skill_dir` as the directory containing this `SKILL.md`, then use the bundled CLI:
-
-```bash
-cli="$skill_dir/scripts/localsend-cli"
-"$cli" --help
-```
-
-To make it available as `localsend-cli`, install the vendored copy:
+First try:
 
 ```bash
-"$skill_dir/scripts/install.sh"
+localsend-transfer --help
 ```
+
+If unavailable, resolve `skill_dir` as the directory containing this
+`SKILL.md` and use the bundled script:
+
+- macOS / Linux:
+  ```bash
+  python3 "$skill_dir/scripts/localsend-cli" --help
+  ```
+- Windows PowerShell:
+  ```powershell
+  py -3 "$skill_dir\scripts\localsend-cli" --help
+  ```
+
+The installed package automatically provides the `cryptography` dependency.
+For the standalone script, install `cryptography` or ensure OpenSSL is on PATH.
 
 ## Discover receivers
 
-Run a short scan and prefer machine-readable output:
+Prefer machine-readable output:
 
 ```bash
-"$cli" discover --json -t 3
+localsend-transfer discover --json -t 3
 ```
 
-For a human-readable scan, omit `--json`. If no device appears, ask the receiver to open LocalSend, keep the screen unlocked, and confirm both devices are on the same local network.
+If no device appears, ask the receiver to open LocalSend, keep it foregrounded,
+and confirm both devices are on the same local network.
 
 ## Send files
 
-Before sending, confirm:
-
-1. The target alias or discovered device.
-2. Every requested path exists and is the intended file.
-3. The user understands the transfer happens over the local network.
-
-Then send one or more files:
+Before sending, confirm the target and that every path exists. Then send:
 
 ```bash
-"$cli" send --to "DEVICE_ALIAS" /path/to/file1 /path/to/file2
+localsend-transfer send --to "DEVICE_ALIAS" /path/to/file1 /path/to/file2
 ```
 
-`--to` is a case-insensitive substring match. Use enough of the alias to avoid sending to the wrong receiver. Do not guess a receiver if discovery returns multiple candidates.
+For direct IP mode without discovery:
+
+```bash
+localsend-transfer send --ip 192.168.1.50 /path/to/file.pdf
+```
+
+`--to` is a case-insensitive substring match. Do not guess when multiple
+receivers match; run discovery and ask the user to choose one.
 
 ## Receive files
 
-Receiving is an interactive operation. Start it only when the user wants this machine to accept a transfer:
+Start receiving only when the user wants this machine to accept a transfer:
 
 ```bash
-mkdir -p "$HOME/Downloads/localsend"
-"$cli" receive --save-dir "$HOME/Downloads/localsend"
+localsend-transfer receive --save-dir ~/Downloads/localsend
 ```
 
-For unattended use, the receiver can auto-accept, but treat that as a security-sensitive choice and confirm it explicitly:
+Auto-accept is security-sensitive and must be explicitly requested:
 
 ```bash
-"$cli" receive -y --save-dir "$HOME/Downloads/localsend"
+localsend-transfer receive -y --save-dir ~/Downloads/localsend
 ```
 
-Stop the receiver with `Ctrl+C`. Report the saved paths and verify that each received file matches the expected name or checksum when one is available.
+Report saved paths after transfer. If the user supplies an expected checksum,
+verify it.
 
 ## Troubleshooting
 
-- `No devices found`: open LocalSend on the other device, keep it foregrounded, and retry discovery.
-- Ambiguous alias: run discovery again and ask the user to choose the exact receiver.
-- `Transfer declined`: the receiver rejected the transfer; retry only after the user accepts it.
-- `--alias` placement: it is a global flag, so put it before the subcommand.
-- Port conflicts: the CLI automatically tries LocalSend fallback ports.
+- `No devices found`: LocalSend must be running on the target, both devices must
+  be on the same LAN, and the screen may need to be unlocked.
+- Firewall: allow UDP/TCP `53317`; the CLI also tries `53318` and `53319`.
+- Ambiguous alias: rerun discovery and ask the user to select the exact target.
+- `--alias` is global and must come before the subcommand.
+- On Windows, run `py -3` if the `python` launcher is not configured.
 
 ## Attribution
 
-The CLI is vendored from [`Chordlini/localsend-cli`](https://github.com/Chordlini/localsend-cli) under MIT; see [`NOTICE.localsend-cli`](NOTICE.localsend-cli) and [`NOTICE.md`](NOTICE.md).
+The CLI is based on [`Chordlini/localsend-cli`](https://github.com/Chordlini/localsend-cli)
+under MIT; see `NOTICE.localsend-cli` and `NOTICE.md`.

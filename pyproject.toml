@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localsend-codex-skill"
+version = "0.1.0"
+description = "Cross-platform LocalSend LAN transfer CLI used by the Codex localsend-transfer skill"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Luoran Yau" }]
+dependencies = [
+  "cryptography>=3.4"
+]
+keywords = ["localsend", "lan", "file-transfer", "codex", "airdrop"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Communications :: File Sharing"
+]
+
+[project.urls]
+Homepage = "https://github.com/qybgh/localsend-codex-skill"
+Repository = "https://github.com/qybgh/localsend-codex-skill"
+Issues = "https://github.com/qybgh/localsend-codex-skill/issues"
+LocalSend = "https://localsend.org"
+UpstreamCLI = "https://github.com/Chordlini/localsend-cli"
+
+[project.scripts]
+localsend-transfer = "localsend_transfer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

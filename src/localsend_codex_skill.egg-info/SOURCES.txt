@@ -1,0 +1,15 @@
+LICENSE
+NOTICE.localsend-cli
+NOTICE.md
+README.md
+pyproject.toml
+setup.py
+src/localsend_codex_skill.egg-info/PKG-INFO
+src/localsend_codex_skill.egg-info/SOURCES.txt
+src/localsend_codex_skill.egg-info/dependency_links.txt
+src/localsend_codex_skill.egg-info/entry_points.txt
+src/localsend_codex_skill.egg-info/requires.txt
+src/localsend_codex_skill.egg-info/top_level.txt
+src/localsend_transfer/__init__.py
+src/localsend_transfer/__main__.py
+src/localsend_transfer/cli.py

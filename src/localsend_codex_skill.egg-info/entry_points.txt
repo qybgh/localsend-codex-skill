@@ -1,0 +1,2 @@
+[console_scripts]
+localsend-transfer = localsend_transfer.cli:main
