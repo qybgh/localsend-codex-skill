@@ -1,0 +1,4 @@
+interface:
+  display_name: "LocalSend Transfer"
+  short_description: "Transfer files over the local network with LocalSend"
+  default_prompt: "Use $localsend-transfer to discover nearby LocalSend devices, send the requested files, or receive files on this machine."

@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+"""localsend-cli — Send and receive files via the LocalSend v2 protocol."""
+
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+import argparse
+import hashlib
+import http.server
+import json
+import mimetypes
+import os
+import platform
+import select
+import socket
+import ssl
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+
+PORT = 53317
+MULTICAST_ADDR = "224.0.0.167"
+PROTOCOL_VERSION = "2.0"
+CHUNK = 65536
+
+# ---------------------------------------------------------------------------
+# TLS helpers
+# ---------------------------------------------------------------------------
+
+def _generate_self_signed_cert():
+    """Generate a self-signed cert+key using openssl, return (certfile, keyfile, fingerprint)."""
+    tmpdir = tempfile.mkdtemp(prefix="localsend-cli-")
+    keyfile = os.path.join(tmpdir, "key.pem")
+    certfile = os.path.join(tmpdir, "cert.pem")
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", keyfile, "-out", certfile,
+            "-days", "1", "-nodes",
+            "-subj", "/CN=localsend-cli",
+        ],
+        check=True, capture_output=True,
+    )
+    # fingerprint = SHA-256 of DER-encoded certificate
+    der = subprocess.run(
+        ["openssl", "x509", "-in", certfile, "-outform", "DER"],
+        check=True, capture_output=True,
+    ).stdout
+    fingerprint = hashlib.sha256(der).hexdigest()
+    return certfile, keyfile, fingerprint
+
+
+def _make_ssl_context_server(certfile, keyfile):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile, keyfile)
+    return ctx
+
+
+def _make_ssl_context_client():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+# ---------------------------------------------------------------------------
+# Device info helpers
+# ---------------------------------------------------------------------------
+
+def _get_alias(args):
+    return getattr(args, "alias", None) or platform.node() or "localsend-cli"
+
+
+def _device_info(alias, fingerprint, *, port=PORT, announce=None):
+    info = {
+        "alias": alias,
+        "version": PROTOCOL_VERSION,
+        "deviceModel": platform.system(),
+        "deviceType": "headless",
+        "fingerprint": fingerprint,
+        "port": port,
+        "protocol": "https",
+        "download": False,
+    }
+    if announce is not None:
+        info["announce"] = announce
+    return info
+
+
+def _get_local_ip():
+    """Best-effort LAN IP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("224.0.0.167", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+def _send_multicast(info_dict):
+    """Send a single UDP multicast announcement."""
+    payload = json.dumps(info_dict).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    sock.sendto(payload, (MULTICAST_ADDR, PORT))
+    sock.close()
+
+
+def _discover(alias, fingerprint, timeout=3.0, certfile=None, keyfile=None):
+    """Discover LocalSend devices via multicast + temporary HTTPS server for /register responses."""
+    devices = {}
+
+    # --- Spin up a temporary HTTPS server to catch /register responses ---
+    # Devices prefer responding via HTTP POST rather than multicast UDP.
+    class _RegisterHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_POST(self):
+            if "/register" in self.path or "/info" in self.path:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length else {}
+                fp = body.get("fingerprint", "")
+                if fp and fp != fingerprint:
+                    devices[fp] = {"ip": self.client_address[0], "info": body}
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        def do_GET(self):
+            if "/info" in self.path:
+                body = json.dumps(_device_info(alias, fingerprint)).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+    listen_port = None
+    http_srv = None
+    for try_port in [PORT, PORT + 1, PORT + 2, PORT + 3]:
+        try:
+            http_srv = http.server.HTTPServer(("0.0.0.0", try_port), _RegisterHandler)
+            if certfile and keyfile:
+                http_srv.socket = _make_ssl_context_server(certfile, keyfile).wrap_socket(
+                    http_srv.socket, server_side=True,
+                )
+            listen_port = try_port
+            break
+        except OSError:
+            continue
+
+    if http_srv:
+        http_thread = threading.Thread(target=http_srv.serve_forever, daemon=True)
+        http_thread.start()
+
+    # --- UDP multicast listener ---
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass
+    sock.bind(("", PORT))
+    mreq = struct.pack("4s4s", socket.inet_aton(MULTICAST_ADDR), socket.inet_aton("0.0.0.0"))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    sock.setblocking(False)
+
+    # Send our announcement (advertise the port our HTTPS server is on)
+    announcement = _device_info(alias, fingerprint, port=listen_port or PORT, announce=True)
+    _send_multicast(announcement)
+
+    deadline = time.monotonic() + timeout
+    next_resend = time.monotonic() + 0.5
+    resends = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([sock], [], [], min(remaining, 0.2))
+        if ready:
+            try:
+                data, addr = sock.recvfrom(4096)
+                info = json.loads(data)
+                fp = info.get("fingerprint", "")
+                if fp and fp != fingerprint:
+                    devices[fp] = {"ip": addr[0], "info": info}
+            except Exception:
+                pass
+        if time.monotonic() >= next_resend and resends < 3:
+            _send_multicast(announcement)
+            resends += 1
+            next_resend = time.monotonic() + 0.5
+
+    sock.close()
+    if http_srv:
+        http_srv.shutdown()
+    return devices
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _https_request(method, url, body=None, headers=None):
+    """Make an HTTPS request ignoring self-signed certs. Returns (status, body_bytes)."""
+    ctx = _make_ssl_context_client()
+    req = urllib.request.Request(url, method=method)
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    if body is not None:
+        if isinstance(body, dict):
+            body = json.dumps(body).encode()
+            req.add_header("Content-Type", "application/json")
+        elif isinstance(body, str):
+            body = body.encode()
+    try:
+        resp = urllib.request.urlopen(req, body, context=ctx, timeout=30)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _upload_file(receiver_ip, receiver_port, session_id, file_id, token, filepath):
+    """Upload a single file to the receiver."""
+    fname = os.path.basename(filepath)
+    mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    size = os.path.getsize(filepath)
+    url = (
+        f"https://{receiver_ip}:{receiver_port}"
+        f"/api/localsend/v2/upload"
+        f"?sessionId={session_id}&fileId={file_id}&token={token}"
+    )
+    ctx = _make_ssl_context_client()
+    req = urllib.request.Request(url, method="POST")
+    req.add_header("Content-Type", mime)
+    req.add_header("Content-Length", str(size))
+    with open(filepath, "rb") as f:
+        resp = urllib.request.urlopen(req, f.read(), context=ctx, timeout=300)
+    return resp.status
+
+# ---------------------------------------------------------------------------
+# send command
+# ---------------------------------------------------------------------------
+
+def cmd_send(args):
+    certfile, keyfile, fingerprint = _generate_self_signed_cert()
+    alias = _get_alias(args)
+
+    # Validate files exist
+    files = []
+    for p in args.files:
+        p = os.path.abspath(p)
+        if not os.path.isfile(p):
+            print(f"Error: {p} is not a file", file=sys.stderr)
+            sys.exit(1)
+        files.append(p)
+
+    # Direct IP mode — skip discovery entirely
+    direct_ip = getattr(args, "ip", None)
+    if direct_ip:
+        # Probe the device for its info
+        target_port = PORT
+        for path in ("/api/localsend/v2/info", "/api/localsend/v1/info"):
+            try:
+                status, body = _https_request("GET", f"https://{direct_ip}:{target_port}{path}")
+                if status == 200:
+                    info = json.loads(body)
+                    target = {"ip": direct_ip, "info": info}
+                    print(f"Connected to {info.get('alias', direct_ip)}")
+                    break
+            except Exception:
+                continue
+        else:
+            print(f"Could not reach device at {direct_ip}:{target_port}", file=sys.stderr)
+            sys.exit(1)
+        # Skip discovery and selection — jump straight to file transfer
+        target_ip = direct_ip
+        target_port = target.get("info", {}).get("port", PORT)
+        print(f"Sending to {target['info'].get('alias', target_ip)}...")
+        # (fall through to file metadata + upload below)
+        # need to set these so the code below works
+        devices = {target["info"].get("fingerprint", ""): target}
+        dev_list = [target]
+        target_name = None
+        # jump past device selection
+    else:
+        target = None
+
+    if target is None:
+        print("Discovering devices...")
+        devices = _discover(alias, fingerprint, timeout=3.0, certfile=certfile, keyfile=keyfile)
+
+        if not devices:
+            print("No devices found. Make sure LocalSend is running on another device on the same network.")
+            sys.exit(1)
+
+        # Select target device
+        dev_list = list(devices.values())
+        target_name = getattr(args, "to", None)
+
+    if target is not None:
+        pass  # Already resolved via --ip
+    elif target_name:
+        # Match by name (case-insensitive substring)
+        needle = target_name.lower()
+        matches = [d for d in dev_list if needle in d["info"].get("alias", "").lower()]
+        if not matches:
+            print(f"No device matching '{target_name}'. Available devices:")
+            for d in dev_list:
+                print(f"  - {d['info'].get('alias', '?')} ({d['ip']})")
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"Multiple devices match '{target_name}':")
+            for d in matches:
+                print(f"  - {d['info'].get('alias', '?')} ({d['ip']})")
+            sys.exit(1)
+        target = matches[0]
+    else:
+        print(f"\nFound {len(dev_list)} device(s):\n")
+        for i, d in enumerate(dev_list):
+            info = d["info"]
+            name = info.get("alias", "Unknown")
+            dtype = info.get("deviceType", "?")
+            model = info.get("deviceModel", "")
+            print(f"  [{i + 1}] {name}  ({dtype}, {model}, {d['ip']})")
+
+        if len(dev_list) == 1:
+            choice = 0
+        else:
+            try:
+                raw = input(f"\nSelect device [1-{len(dev_list)}]: ").strip()
+                choice = int(raw) - 1
+                if choice < 0 or choice >= len(dev_list):
+                    raise ValueError
+            except (ValueError, EOFError):
+                print("Invalid selection.", file=sys.stderr)
+                sys.exit(1)
+
+        target = dev_list[choice]
+    target_ip = target["ip"]
+    target_port = target["info"].get("port", PORT)
+    print(f"\nSending to {target['info'].get('alias', target_ip)}...")
+
+    # Build file metadata
+    files_meta = {}
+    for filepath in files:
+        fid = str(uuid.uuid4())
+        fname = os.path.basename(filepath)
+        size = os.path.getsize(filepath)
+        mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        files_meta[fid] = {
+            "id": fid,
+            "fileName": fname,
+            "size": size,
+            "fileType": mime,
+            "sha256": None,
+            "preview": None,
+        }
+
+    prepare_body = {
+        "info": _device_info(alias, fingerprint),
+        "files": files_meta,
+    }
+
+    url = f"https://{target_ip}:{target_port}/api/localsend/v2/prepare-upload"
+    status, resp_body = _https_request("POST", url, body=prepare_body)
+
+    if status == 204:
+        print("Receiver indicated nothing to transfer.")
+        return
+    if status == 403:
+        print("Transfer declined by receiver.")
+        sys.exit(1)
+    if status == 409:
+        print("Receiver is busy with another transfer.")
+        sys.exit(1)
+    if status != 200:
+        print(f"prepare-upload failed (HTTP {status}): {resp_body.decode(errors='replace')}", file=sys.stderr)
+        sys.exit(1)
+
+    resp = json.loads(resp_body)
+    session_id = resp["sessionId"]
+    file_tokens = resp.get("files", {})
+
+    # Map file_id -> filepath
+    id_to_path = {}
+    for fid, meta in files_meta.items():
+        for filepath in files:
+            if os.path.basename(filepath) == meta["fileName"]:
+                id_to_path[fid] = filepath
+                break
+
+    uploaded = 0
+    for fid, token in file_tokens.items():
+        if token is None:
+            print(f"  Skipped: {files_meta[fid]['fileName']} (declined by receiver)")
+            continue
+        filepath = id_to_path[fid]
+        fname = os.path.basename(filepath)
+        size = os.path.getsize(filepath)
+        print(f"  Uploading: {fname} ({size} bytes)...", end=" ", flush=True)
+        try:
+            st = _upload_file(target_ip, target_port, session_id, fid, token, filepath)
+            print("done." if st == 200 else f"HTTP {st}")
+            uploaded += 1
+        except Exception as e:
+            print(f"failed: {e}")
+
+    print(f"\n{uploaded}/{len(file_tokens)} file(s) sent.")
+
+# ---------------------------------------------------------------------------
+# receive command — HTTPS server
+# ---------------------------------------------------------------------------
+
+class ReceiveHandler(http.server.BaseHTTPRequestHandler):
+    """Handle incoming LocalSend v2 requests."""
+
+    server_version = "localsend-cli"
+
+    def log_message(self, fmt, *a):
+        pass  # Suppress default logging
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, code, text=""):
+        body = text.encode() if text else b""
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length)
+
+    def _parse_qs(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        return parsed.path, {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+    def do_GET(self):
+        path, _ = self._parse_qs()
+        if path in ("/api/localsend/v2/info", "/api/localsend/v1/info"):
+            self._send_json(200, _device_info(
+                self.server.ls_alias, self.server.ls_fingerprint,
+            ))
+        else:
+            self._send_text(404, "Not found")
+
+    def do_POST(self):
+        path, qs = self._parse_qs()
+
+        if path == "/api/localsend/v2/register":
+            body = json.loads(self._read_body())
+            fp = body.get("fingerprint", "")
+            if fp and fp != self.server.ls_fingerprint:
+                self.server.ls_devices[fp] = {"ip": self.client_address[0], "info": body}
+            self._send_text(200, "OK")
+            return
+
+        if path in ("/api/localsend/v2/prepare-upload", "/api/localsend/v1/send-request"):
+            self._handle_prepare_upload(path)
+            return
+
+        if path in ("/api/localsend/v2/upload", "/api/localsend/v1/send"):
+            self._handle_upload(path, qs)
+            return
+
+        if path in ("/api/localsend/v2/cancel", "/api/localsend/v1/cancel"):
+            with self.server.ls_lock:
+                self.server.ls_session = None
+                self.server.ls_file_tokens = {}
+                self.server.ls_file_meta = {}
+            print("\nTransfer cancelled by sender.")
+            self._send_text(200)
+            return
+
+        self._send_text(404, "Not found")
+
+    def _handle_prepare_upload(self, path):
+        body = json.loads(self._read_body())
+        sender_info = body.get("info", {})
+        files = body.get("files", {})
+        sender_name = sender_info.get("alias", self.client_address[0])
+
+        with self.server.ls_lock:
+            if self.server.ls_session is not None:
+                self._send_text(409, "Busy")
+                return
+
+        # Display incoming request
+        total_size = sum(f.get("size", 0) for f in files.values())
+        print(f"\nIncoming transfer from {sender_name} ({self.client_address[0]}):")
+        for fid, fmeta in files.items():
+            print(f"  - {fmeta.get('fileName', fid)} ({fmeta.get('size', 0)} bytes)")
+        print(f"  Total: {total_size} bytes, {len(files)} file(s)")
+
+        if not self.server.ls_auto_accept:
+            try:
+                ans = input("Accept? [Y/n] ").strip().lower()
+                if ans and ans != "y":
+                    self._send_json(403, {"message": "Declined"})
+                    print("Declined.")
+                    return
+            except EOFError:
+                self._send_json(403, {"message": "Declined"})
+                return
+
+        session_id = str(uuid.uuid4())
+        file_tokens = {}
+        for fid in files:
+            file_tokens[fid] = str(uuid.uuid4())
+
+        with self.server.ls_lock:
+            self.server.ls_session = session_id
+            self.server.ls_sender_ip = self.client_address[0]
+            self.server.ls_file_tokens = dict(file_tokens)
+            self.server.ls_file_meta = dict(files)
+            self.server.ls_received_count = 0
+            self.server.ls_expected_count = len(files)
+
+        is_v2 = "v2" in path
+        if is_v2:
+            self._send_json(200, {"sessionId": session_id, "files": file_tokens})
+        else:
+            # v1 response: flat map of fileId -> token
+            self._send_json(200, file_tokens)
+
+        print("Accepted. Waiting for files...")
+
+    def _handle_upload(self, path, qs):
+        session_id = qs.get("sessionId", "")
+        file_id = qs.get("fileId", "")
+        token = qs.get("token", "")
+
+        with self.server.ls_lock:
+            if "v2" in path and session_id != self.server.ls_session:
+                self._send_text(403, "Invalid session")
+                return
+            expected_token = self.server.ls_file_tokens.get(file_id)
+            if "v2" in path and token != expected_token:
+                self._send_text(403, "Invalid token")
+                return
+            meta = self.server.ls_file_meta.get(file_id, {})
+
+        fname = meta.get("fileName", file_id)
+        save_dir = self.server.ls_save_dir
+        os.makedirs(save_dir, exist_ok=True)
+
+        dest = os.path.join(save_dir, fname)
+        # Avoid overwriting
+        if os.path.exists(dest):
+            base, ext = os.path.splitext(fname)
+            i = 1
+            while os.path.exists(dest):
+                dest = os.path.join(save_dir, f"{base} ({i}){ext}")
+                i += 1
+
+        length = int(self.headers.get("Content-Length", 0))
+        received = 0
+        try:
+            with open(dest, "wb") as f:
+                while received < length:
+                    chunk = self.rfile.read(min(CHUNK, length - received))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+        except Exception as e:
+            print(f"  Error receiving {fname}: {e}")
+            self._send_text(500, str(e))
+            return
+
+        print(f"  Saved: {dest} ({received} bytes)")
+        self._send_text(200, "OK")
+
+        with self.server.ls_lock:
+            self.server.ls_received_count += 1
+            if self.server.ls_received_count >= self.server.ls_expected_count:
+                self.server.ls_session = None
+                self.server.ls_file_tokens = {}
+                self.server.ls_file_meta = {}
+                print(f"\nAll {self.server.ls_expected_count} file(s) received.")
+
+
+class ReceiveServer(http.server.HTTPServer):
+    """HTTPS server for receiving LocalSend transfers."""
+
+    def __init__(self, addr, handler, *, certfile, keyfile, alias, fingerprint, save_dir, auto_accept):
+        super().__init__(addr, handler)
+        self.socket = _make_ssl_context_server(certfile, keyfile).wrap_socket(
+            self.socket, server_side=True,
+        )
+        self.ls_alias = alias
+        self.ls_fingerprint = fingerprint
+        self.ls_save_dir = save_dir
+        self.ls_auto_accept = auto_accept
+        self.ls_devices = {}
+        # Session state
+        self.ls_lock = threading.Lock()
+        self.ls_session = None
+        self.ls_sender_ip = None
+        self.ls_file_tokens = {}
+        self.ls_file_meta = {}
+        self.ls_received_count = 0
+        self.ls_expected_count = 0
+
+
+def _run_multicast_listener(server, alias, fingerprint, listen_port=PORT):
+    """Background thread: listen for multicast announcements and respond."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass
+    sock.bind(("", PORT))
+    mreq = struct.pack("4s4s", socket.inet_aton(MULTICAST_ADDR), socket.inet_aton("0.0.0.0"))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    sock.settimeout(1.0)
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            info = json.loads(data)
+        except Exception:
+            continue
+        fp = info.get("fingerprint", "")
+        if not fp or fp == fingerprint:
+            continue
+        # Register this device
+        server.ls_devices[fp] = {"ip": addr[0], "info": info}
+        # Respond via HTTP POST /register
+        sender_port = info.get("port", PORT)
+        resp_info = _device_info(alias, fingerprint, port=listen_port)
+        try:
+            _https_request(
+                "POST",
+                f"https://{addr[0]}:{sender_port}/api/localsend/v2/register",
+                body=resp_info,
+            )
+        except Exception:
+            # Fallback: respond via multicast with announce=false
+            reply = _device_info(alias, fingerprint, port=listen_port, announce=False)
+            _send_multicast(reply)
+
+
+def cmd_receive(args):
+    certfile, keyfile, fingerprint = _generate_self_signed_cert()
+    alias = _get_alias(args)
+    save_dir = os.path.expanduser(args.save_dir)
+    auto_accept = args.yes
+
+    # Try the standard port first, fall back to alternatives if in use
+    listen_port = PORT
+    server = None
+    for try_port in [PORT, PORT + 1, PORT + 2]:
+        try:
+            server = ReceiveServer(
+                ("0.0.0.0", try_port), ReceiveHandler,
+                certfile=certfile, keyfile=keyfile,
+                alias=alias, fingerprint=fingerprint,
+                save_dir=save_dir, auto_accept=auto_accept,
+            )
+            listen_port = try_port
+            break
+        except OSError as e:
+            if e.errno == 98 and try_port != PORT + 2:  # Address in use
+                continue
+            raise
+    assert server is not None
+
+    # Start multicast listener in background
+    t = threading.Thread(target=_run_multicast_listener, args=(server, alias, fingerprint, listen_port), daemon=True)
+    t.start()
+
+    # Also send an announcement so others discover us
+    announcement = _device_info(alias, fingerprint, port=listen_port, announce=True)
+    _send_multicast(announcement)
+
+    local_ip = _get_local_ip()
+    print(f"Listening on https://{local_ip}:{listen_port}")
+    print(f"Alias: {alias}")
+    print(f"Saving files to: {save_dir}")
+    if auto_accept:
+        print("Auto-accept mode: ON")
+    print("Press Ctrl+C to stop.\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.shutdown()
+
+# ---------------------------------------------------------------------------
+# discover command
+# ---------------------------------------------------------------------------
+
+def cmd_discover(args):
+    certfile, keyfile, fingerprint = _generate_self_signed_cert()
+    alias = _get_alias(args)
+    timeout = args.timeout
+
+    print(f"Scanning for {timeout}s...")
+    devices = _discover(alias, fingerprint, timeout=timeout, certfile=certfile, keyfile=keyfile)
+
+    if args.json:
+        out = []
+        for fp, d in devices.items():
+            info = d["info"]
+            out.append({
+                "alias": info.get("alias", "Unknown"),
+                "ip": d["ip"],
+                "port": info.get("port", PORT),
+                "protocol": info.get("protocol", "https"),
+                "deviceType": info.get("deviceType", "desktop"),
+                "deviceModel": info.get("deviceModel", ""),
+                "version": info.get("version", "1.0"),
+                "fingerprint": fp,
+            })
+        print(json.dumps(out, indent=2))
+        return
+
+    if not devices:
+        print("No devices found.")
+        return
+
+    print(f"\nFound {len(devices)} device(s):\n")
+    for fp, d in devices.items():
+        info = d["info"]
+        name = info.get("alias", "Unknown")
+        dtype = info.get("deviceType", "?")
+        model = info.get("deviceModel", "")
+        version = info.get("version", "v1?")
+        proto = info.get("protocol", "https")
+        port = info.get("port", PORT)
+        print(f"  {name}")
+        print(f"    IP: {d['ip']}:{port} ({proto})")
+        print(f"    Type: {dtype}, Model: {model}, Protocol: v{version}")
+        print(f"    Fingerprint: {fp[:16]}...")
+        print()
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="localsend-cli",
+        description="Send and receive files via the LocalSend v2 protocol.",
+    )
+    parser.add_argument("--alias", help="Device name to advertise (default: hostname)")
+    sub = parser.add_subparsers(dest="command")
+
+    # send
+    p_send = sub.add_parser("send", help="Send files to a device")
+    p_send.add_argument("files", nargs="+", help="Files to send")
+    p_send.add_argument("--to", help="Target device name (case-insensitive substring match, skips interactive picker)")
+    p_send.add_argument("--ip", help="Target device IP directly (skip discovery, useful for iOS devices)")
+
+    # receive
+    p_recv = sub.add_parser("receive", help="Listen for incoming transfers")
+    p_recv.add_argument("--save-dir", default="~/Downloads", help="Directory to save files (default: ~/Downloads)")
+    p_recv.add_argument("-y", "--yes", action="store_true", help="Auto-accept incoming transfers")
+
+    # discover
+    p_disc = sub.add_parser("discover", help="List nearby LocalSend devices")
+    p_disc.add_argument("-t", "--timeout", type=float, default=3.0, help="Discovery timeout in seconds (default: 3)")
+    p_disc.add_argument("--json", action="store_true", help="Output as JSON (machine-readable)")
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    {"send": cmd_send, "receive": cmd_receive, "discover": cmd_discover}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
