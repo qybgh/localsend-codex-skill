@@ -66,6 +66,11 @@ From the skill directory:
 - Avoid auto-accepting incoming transfers unless the machine and network are trusted.
 - Confirm target aliases and file paths before sending.
 
+## Community
+
+- [Linux.do](https://linux.do) — a friendly developer community. Thanks for the
+  discussions, feedback, and inspiration that support projects like this one.
+
 ## License
 
 This repository is released under the [MIT License](LICENSE). The vendored CLI
